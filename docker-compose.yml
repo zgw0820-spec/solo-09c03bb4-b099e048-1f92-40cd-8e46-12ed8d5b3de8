@@ -8,6 +8,14 @@ services:
       DB_PATH: /data/primary.db
       DNS_PORT: "5053"
       API_PORT: "8000"
+      # UDP admission control (bounded threads/queue/source state).
+      ADMISSION_ENABLED: "true"
+      RATE_LIMIT_PER_SOURCE: "20"
+      RATE_BURST_PER_SOURCE: "40"
+      INFLIGHT_PER_SOURCE: "4"
+      INFLIGHT_GLOBAL: "32"
+      MAX_TRACKED_SOURCES: "1024"
+      DNS_WORKERS: "8"
     ports:
       - "8080:8000"      # primary Swagger / REST
       - "5053:5053/udp"  # primary DNS
@@ -34,6 +42,14 @@ services:
       PRIMARY_API_URL: http://primary:8000
       SYNC_INTERVAL: "3"
       HTTP_TIMEOUT: "10"
+      # Same local admission policy as the primary.
+      ADMISSION_ENABLED: "true"
+      RATE_LIMIT_PER_SOURCE: "20"
+      RATE_BURST_PER_SOURCE: "40"
+      INFLIGHT_PER_SOURCE: "4"
+      INFLIGHT_GLOBAL: "32"
+      MAX_TRACKED_SOURCES: "1024"
+      DNS_WORKERS: "8"
     ports:
       - "8081:8000"      # backup Swagger / REST
       - "5054:5053/udp"  # backup DNS

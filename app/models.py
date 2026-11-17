@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -99,3 +99,41 @@ class PublishResult(BaseModel):
     serial: int
     record_count: int
     published_at: str
+
+
+class AdmissionSourceOut(BaseModel):
+    source: str
+    inflight: int
+    tokens: float
+    seen: int
+    rejected: int
+
+
+class AdmissionConfigOut(BaseModel):
+    rate_per_source: int
+    burst_per_source: int
+    inflight_per_source: int
+    inflight_global: int
+    max_tracked_sources: int
+
+
+class AdmissionOut(BaseModel):
+    """Local admission-control status and per-reason SERVFAIL counters."""
+
+    enabled: bool
+    config: AdmissionConfigOut
+    uptime_seconds: float
+    tracked_sources: int
+    global_inflight: int
+    peak_global_inflight: int
+    total_allowed: int
+    total_rejected: int
+    rejections: Dict[str, int]
+    sources: List[AdmissionSourceOut]
+    malformed_packets: int
+    internal_errors: int
+
+
+class AdmissionResetOut(BaseModel):
+    ok: bool
+    message: str

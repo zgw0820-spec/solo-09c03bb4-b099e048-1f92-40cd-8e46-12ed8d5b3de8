@@ -8,6 +8,40 @@
   版本查询；两机各自使用独立 SQLite 数据库（不同文件/卷）。
 - 两机都通过 **UDP 53 风格端口（默认 5053）** 回答区域内 A 查询，每个回答只取自
   **一份不可变的完整版本**快照，绝不混版。
+- 两机的区域内 UDP 查询都带**本地准入控制**：单一来源持续占用时其他来源仍能得到
+  应答；超额请求立即返回 SERVFAIL，不会为洪泛创建无界线程/队列；来源地址不断变化
+  时按来源的状态表也是定容 LRU，内存占用有上界。
+
+## UDP 准入控制（主备均启用）
+
+故障终端持续刷查询时，默认 dnslib 服务用 `ThreadingMixIn` **每个报文新建一个线程**
+且队列无界，会拖垮整机并饿死其他终端。本服务替换为有界模型：
+
+- **1 个固定监听线程**拥有 socket，在**入线程池之前**完成全部准入判断；被拒查询在
+  监听线程内直接回 SERVFAIL，既不创建工作线程也不进入队列。
+- **1 个固定大小工作线程池**（`DNS_WORKERS`）+ 全局在途上限（`INFLIGHT_GLOBAL`），
+  线程数与排队任务数在任何报文速率下都有硬上界。
+- 每来源三重门限（`app/admission.py`）：
+  - **令牌桶** `RATE_LIMIT_PER_SOURCE` / `RATE_BURST_PER_SOURCE`：持续速率 + 突发额度，
+    超额即 `rate_limited` 拒绝；
+  - **单来源在途上限** `INFLIGHT_PER_SOURCE`：一个来源最多并发处理的查询数，
+    超出即 `source_inflight_full`，保证它无法占满工作线程；
+  - **全局在途上限** `INFLIGHT_GLOBAL`：所有来源合计并发上限，也是队列长度上界，
+    超出即 `global_inflight_full`。
+- **定容来源表** `MAX_TRACKED_SOURCES`：按来源 IP（不含端口，故轮换源端口无法绕过）
+  保存令牌/在途/计数；表满时按 LRU 淘汰（优先淘汰在途为 0 的条目），来源地址不断
+  变化也不会无限积累状态。
+- 区域**外**查询由监听线程就地回 REFUSED，不占工作线程、不进准入账本；无法解析的
+  坏报文计入 `malformed_packets` 且不影响服务。
+- 获准查询仍由本机**完整区域版本**快照应答，发布与备用同步走独立 HTTP/线程路径，
+  UDP 洪泛期间持续可用。
+
+准入 API（主备两机都暴露，原接口全部保留）：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET  /api/admission` | 生效门限、跟踪来源数、全局/峰值在途、累计放行、按原因的 SERVFAIL 拒绝计数、每来源明细、坏报文/内部错误计数 |
+| `POST /api/admission/reset` | 清零计数与来源表（门限继续生效），便于压测前后取数 |
 
 ## 设计要点与需求对应
 
@@ -23,6 +57,10 @@
 | 迟到旧传输不得回退 | `commit_version()` 拒绝任何 `serial <= active_serial` 的版本（返回 `ignored_stale`/False），事务保护 |
 | 任一方失败仍供原版 | 发布失败保留旧 active；同步失败保留旧 active；DNS 与 HTTP 在同一进程内独立运行 |
 | 主机发布无需等待备用 | 主机 API 不调用备用机；e2e 中备用停机时发布仍在毫秒级成功 |
+| 单源故障不饿死其他来源 | 监听线程入池前做准入：每来源令牌桶+在途上限，超额立即 SERVFAIL；过载自测中他源 12/12 正常应答 |
+| 不无限建线程/排队 | 固定监听线程 + 固定 `DNS_WORKERS` 线程池 + `INFLIGHT_GLOBAL` 在途闸门，队列长度有硬上界 |
+| 来源变化不无限积累状态 | 来源状态为定容 LRU（`MAX_TRACKED_SOURCES`，按源 IP），表满优先淘汰空闲条目 |
+| 本机准入/拒绝计数 API | `GET /api/admission`（主备均有，含按原因计数）、`POST /api/admission/reset`，原接口不变 |
 | Docker Compose 双服务 + Swagger | `docker-compose.yml` 起 primary/backup；`http://<host>:8080/docs`、`http://<host>:8081/docs` |
 
 ### 数据模型（SQLite，WAL 模式）
@@ -51,6 +89,8 @@ state(key TEXT PRIMARY KEY, value TEXT)
 - `GET  /api/zone` 当前完整区域（含 serial、records、published_at）
 - `POST /api/zone` **仅主机**，请求体 `{"records":[{"name":"db.internal.local","ip":"10.0.0.11"}]}`，成功返回 201 与新 serial
 - `POST /api/sync` **仅备用机**，立即拉取一次，返回 `synced` / `ignored_stale` / `failed`
+- `GET  /api/admission` **主备均有**，本机准入状态与按原因的 SERVFAIL 拒绝计数
+- `POST /api/admission/reset` **主备均有**，清零准入计数（门限不变）
 
 DNS 行为：区域内 A 查询命中返回 NOERROR+A；区域内不存在的名称 NXDOMAIN；
 区域内非 A 查询（如 AAAA）返回 NOERROR NODATA；区域外查询 REFUSED。
@@ -91,9 +131,10 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/test_unit.py -q     # 校验/事务/防回退单元测试
+.venv/bin/python -m pytest tests/test_unit.py tests/test_admission.py -q  # 校验/事务/防回退 + 准入控制单元测试
 .venv/bin/python -I tests/e2e_test.py                # 双进程端到端 30 项
 .venv/bin/python -I tests/auto_sync_test.py          # 自动同步/幂等/Swagger 8 项
+.venv/bin/python -I tests/admission_overload_test.py # UDP 过载/公平性/有界状态 20 项
 ```
 
 端到端覆盖：启动空版本 NXDOMAIN、非法发布不升序号、发布后 UDP 应答、
@@ -112,6 +153,13 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 | `SYNC_INTERVAL` | `5` | 备用机后台同步间隔秒 |
 | `HTTP_TIMEOUT` | `10` | 拉取区域 HTTP 超时秒 |
 | `MAX_RECORDS` | `8` | 单次区域最大 A 记录数 |
+| `ADMISSION_ENABLED` | `true` | 是否启用区域内 UDP 查询准入（关闭时仍保留有界线程池） |
+| `RATE_LIMIT_PER_SOURCE` | `20` | 每来源每秒令牌补充速率（持续 QPS） |
+| `RATE_BURST_PER_SOURCE` | `40` | 每来源令牌桶突发容量 |
+| `INFLIGHT_PER_SOURCE` | `4` | 单来源最大并发处理查询数 |
+| `INFLIGHT_GLOBAL` | `32` | 所有来源合计最大并发（同时是队列长度上界） |
+| `MAX_TRACKED_SOURCES` | `1024` | 跟踪来源状态表的定容上限（LRU 淘汰） |
+| `DNS_WORKERS` | `8` | UDP 工作线程池固定大小（不随报文增长） |
 
 ## 已知边界
 

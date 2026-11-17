@@ -6,9 +6,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
+from .admission import admission
 from .config import settings
 from .dns_server import dns_service
 from .models import (
+    AdmissionOut,
+    AdmissionResetOut,
     PublishResult,
     RecordOut,
     VersionOut,
@@ -143,3 +146,36 @@ async def manual_sync() -> dict:
     result = outcome.as_dict()
     result["zone"] = _zone_out().model_dump()
     return result
+
+
+# ------------------------------------------------------------- admission
+@app.get(
+    "/api/admission",
+    response_model=AdmissionOut,
+    tags=["admission"],
+)
+def get_admission() -> AdmissionOut:
+    """Local UDP admission status and per-reason SERVFAIL counters.
+
+    Exposed by both roles. Shows the effective limits, bounded source
+    table, per-source inflight/seen/rejected counters and the global
+    rejection counters (``rejections``).
+    """
+    data = admission.snapshot()
+    data.update(dns_service.stats())
+    return AdmissionOut(**data)
+
+
+@app.post(
+    "/api/admission/reset",
+    response_model=AdmissionResetOut,
+    tags=["admission"],
+)
+def reset_admission() -> AdmissionResetOut:
+    """Zero the admission counters (limits stay in force)."""
+    admission.reset_counters()
+    dns_service.reset_stats()
+    return AdmissionResetOut(
+        ok=True,
+        message="admission counters and source table have been reset",
+    )
